@@ -12,7 +12,7 @@
 const appconst = require("./appconstant.js");
 const { axiosInstance } = require("./axios_instance");
 const { getToken } = require("./utils");
-const openai_url = "xxx";
+const openai_url = "https://xxxx-sgp.xxxx.com:3900/api/xxxx/completions";
 const token = "sk-xxx";
 const mcp_server_url = "https://xxxx-sgp.xxxx.com:3085";
 const mcp_tools = ["time", "space-jdbc"];
@@ -39,24 +39,73 @@ async function fetchToolServers() {
   return tool_servers;
 }
 
-function getParameters(details) {
+function resolveRef(ref, openapi) {
+  if (!ref.startsWith('#/')) return null;
+  const parts = ref.slice(2).split('/');
+  let result = openapi;
+  for (const part of parts) {
+    if (!(part in result)) return null;
+    result = result[part];
+  }
+  return result;
+}
+
+function getParameters(details, openapi) {
+  const paramProps = {};
+  const required = [];
+
+  // 1. Handle parameters array (path, query, header, cookie)
+  if (details.parameters) {
+    for (const param of details.parameters) {
+      const p = param.$ref ? resolveRef(param.$ref, openapi) : param;
+      if (!p) continue;
+      const schema = p.schema ? (p.schema.$ref ? resolveRef(p.schema.$ref, openapi) : p.schema) : {};
+      paramProps[p.name] = { ...schema, description: p.description };
+      if (p.required) required.push(p.name);
+    }
+  }
+
+  // 2. Handle requestBody (for POST, PUT, etc)
   if (
     details.requestBody &&
     details.requestBody.content &&
     details.requestBody.content["application/json"] &&
     details.requestBody.content["application/json"].schema
   ) {
-    return details.requestBody.content["application/json"].schema;
-  } else {
-    return { type: "object", properties: {}, required: [] };
+    let bodySchema = details.requestBody.content["application/json"].schema;
+    if (bodySchema.$ref) {
+      bodySchema = resolveRef(bodySchema.$ref, openapi);
+    }
+    // If body schema is an object, merge its properties in
+    if (bodySchema && bodySchema.type === "object" && bodySchema.properties) {
+      for (const [key, prop] of Object.entries(bodySchema.properties)) {
+        let resolvedProp = prop;
+        if (prop.$ref) resolvedProp = resolveRef(prop.$ref, openapi);
+        paramProps[key] = resolvedProp;
+      }
+      if (Array.isArray(bodySchema.required)) {
+        required.push(...bodySchema.required);
+      }
+    } else if (bodySchema) {
+      // For non-object, treat as 'body' property
+      paramProps.body = bodySchema;
+      required.push('body');
+    }
   }
+
+  return {
+    type: "object",
+    properties: paramProps,
+    required: Array.from(new Set(required)),
+  };
 }
 
 async function createToolDefinitions(toolServers) {
   const tools = [];
 
   for (const server of toolServers) {
-    const paths = server.openapi.paths || {};
+    const openapi = server.openapi;
+    const paths = openapi.paths || {};
 
     for (const [path, methods] of Object.entries(paths)) {
       for (const [method, details] of Object.entries(methods)) {
@@ -66,9 +115,8 @@ async function createToolDefinitions(toolServers) {
           type: "function",
           function: {
             name: details.operationId,
-            description:
-              details.description || `${method.toUpperCase()} ${path}`,
-            parameters: getParameters(details),
+            description: details.description || `${method.toUpperCase()} ${path}`,
+            parameters: getParameters(details, openapi),
           },
           server_info: {
             url: server.url,
